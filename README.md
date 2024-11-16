@@ -6,5 +6,5 @@
 - Run scrape_game_wrapper.py to process all available data
 
 # Processing a new week
-- Run the donwload_weekly_pages.py script
+- Run the download_weekly_pages.py script
 - Run the scrape_game.py script with year and week as input
