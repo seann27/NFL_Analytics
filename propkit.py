@@ -9,6 +9,34 @@ propkit.py - deterministic data + scoring + PDF pipeline for the NFL prop workfl
 `data` downloads nflverse files, computes team metrics/ranks/lane labels, in-scope players,
 L10 windows, H2H, red-zone shares, and writes DIR/data.json + DIR/summary.txt (compact, for Claude)
 + DIR/lines_template.csv. `report` applies the 04/05/07 rules and builds the PDF.
+
+v2 (game theory, Week 3 2026 post-mortem)
+  data:
+    --add "Name,Name"        force players into scope (next man up)
+    scope                    current-season role weighted more; 0-games-this-season players discounted;
+                             WR/TE with 12%+ of targets this season added; next man up behind a Questionable WR/TE;
+                             roster status EXE/RES/SUS/etc. treated as Out even when not on the injury report
+    GAME THEORY block        play-caller profile (week-to-week variability, pass rate leading/trailing),
+                             REMATCH flags (a lane that dominated a meeting in the last 2 seasons),
+                             starter-level injuries (OL, defensive front, secondary) from snap shares,
+                             ONE-DIMENSIONAL risk (2+ OL starters out, or 1 + RB1 out), lane-label shifts,
+                             TAKE-AWAY candidates (data half of the 04 obviousness score)
+  report:
+    scenarios drive projections: each scenario has its own plays / pass rate / efficiency; projections and
+      P(over) are probability-weighted mixtures; robustness = share of scenario weight where the lean wins
+    coach-specific leading/trailing pass rates replace the generic "leader runs" heuristic
+    shares: current-season role blended in; vacated volume goes to current role holders; shares capped at the team
+    rematch rule, one-dimensional rule, take-away rule, gates A/C/D/E (see 04 Step 9)
+  new context.json keys (all optional):
+    coach_type {"TEAM": "Adaptive"|"Identity"|"Unknown"}      overrides the data hint
+    rematch {"TEAM": {"apply": bool, "eff": -0.10, "pass_rate": 0.05}} or {"TEAM": false}
+    one_dimensional {"TEAM": false | {"ol_out": 2, "rb1_out": true}}
+    takeaway {"TEAM": ["Name"]} or {"TEAM": {"Name": {"eff": -0.15, "vol": 0.85}}}
+    counter_plan {"name", "prob", "desc", "pass_rate": {"TEAM": x}, "plays": {...}, "eff": {"TEAM:Lane": x}}
+    scenarios_model [ {"name","prob","desc","plays","pass_rate","eff"} ... ]   full scenario override
+    eff {"TEAM:Lane": x}        analyst efficiency adjustment in every scenario
+    kill {"Name|market": "reason"}   Gate A (consistency) removal
+    gate_ok ["Name|market"]          lifts Gate D when you can name what the market is missing
 """
 import argparse, json, math, os, re, subprocess, sys, datetime as dt
 import warnings
@@ -230,6 +258,82 @@ def blend_metrics(cur, prior, k=6):
         res[side] = b
     return res
 
+# ----------------------------------------------------------------------------- game theory helpers (v2)
+LABEL_LADDER = ["FADE", "LEAN FADE", "NEUTRAL", "LEAN ATTACK", "ATTACK"]
+OL_POS = {"C", "G", "T", "OT", "OG", "OL"}
+FRONT_POS = {"DT", "DE", "NT", "LB", "ILB", "OLB", "MLB", "DL", "EDGE"}
+BACK_POS = {"CB", "S", "FS", "SS", "DB", "SAF"}
+RUN_METRICS = {"rush_att", "rush_yds", "rush_rec_yds"}
+PASS_METRICS = {"pass_yds", "pass_att", "cmp", "targets", "rec", "rec_yds"}
+
+def shift_label(label, steps):
+    """Move a lane label toward ATTACK (+) or FADE (-). CONTESTED/VOLATILE are treated as NEUTRAL first."""
+    if label in ("N/A", None) or steps == 0:
+        return label
+    base = "NEUTRAL" if label in ("CONTESTED", "VOLATILE") else label
+    k = LABEL_LADDER.index(base) + steps
+    return LABEL_LADDER[max(0, min(len(LABEL_LADDER) - 1, k))]
+
+def coach_profiles(pbp, season):
+    """Per-team play-caller profile over each team's last 10 games in pbp.
+    gp_sd = game-to-game spread in neutral pass rate AFTER removing binomial noise (pts). Teams are ranked
+    league-wide: top 10 = Adaptive (plan changes by opponent), bottom 10 = Identity, rest = Mixed.
+    lead/trail deltas = pass rate in that state minus the team's overall rate, shrunk toward league (150 plays)."""
+    if pbp.empty:
+        return {}
+    pl = pbp[pbp.play_type.isin(["pass", "run"]) & (pbp.two_point_attempt.fillna(0) == 0) & pbp.posteam.notna()].copy()
+    pl["pr"] = pl.qb_dropback.fillna(0)
+    games = pl[["game_id", "posteam", "season", "week"]].drop_duplicates().sort_values(["season", "week"])
+    raw = {}
+    for t, gg in games.groupby("posteam"):
+        last = gg.tail(10)
+        x = pl[(pl.posteam == t) & pl.game_id.isin(last.game_id)]
+        neu = x[x.wp.between(.2, .8) & (x.qtr <= 3)]
+        per = neu.groupby("game_id").pr.agg(["mean", "size"])
+        per = per[per["size"] >= 10]
+        lead, trail = x[x.score_differential >= 7], x[x.score_differential <= -7]
+        raw[t] = {"n_games": int(len(per)), "n_cur": int((last.season == season).sum()),
+                  "all": x.pr.mean(), "neutral": neu.pr.mean(),
+                  "lead": (lead.pr.mean(), len(lead)), "trail": (trail.pr.mean(), len(trail)),
+                  "lead_2h": (lead[lead.qtr >= 3].pr.mean(), int((lead.qtr >= 3).sum())),
+                  "early": neu[neu.down.isin([1, 2])].pr.mean()}
+        if len(per) >= 4:
+            pbar = neu.pr.mean()
+            noise = float((pbar * (1 - pbar) / per["size"]).mean())
+            raw[t]["gp_sd"] = math.sqrt(max(0.0, float(per["mean"].var(ddof=1)) - noise)) * 100
+            raw[t]["gp_range"] = float(per["mean"].max() - per["mean"].min()) * 100
+        else:
+            raw[t]["gp_sd"] = None; raw[t]["gp_range"] = None
+    def lg_delta(k):
+        v = [raw[t][k][0] - raw[t]["all"] for t in raw if raw[t][k][1] >= 30 and not pd.isna(raw[t][k][0])]
+        return float(np.mean(v)) if v else 0.0
+    lg = {"lead": lg_delta("lead"), "trail": lg_delta("trail"), "lead_2h": lg_delta("lead_2h")}
+    K = 150.0
+    out = {}
+    for t, v in raw.items():
+        o = {"n_games": v["n_games"], "n_cur": v["n_cur"], "overall_pr": r(v["all"] * 100, 1), "neutral_pr": r(v["neutral"] * 100, 1),
+             "early_down_pr": r(v["early"] * 100, 1), "gp_sd": r(v["gp_sd"], 1), "gp_range": r(v["gp_range"], 1)}
+        for k in ("lead", "trail", "lead_2h"):
+            rate, n = v[k]
+            own = (rate - v["all"]) if (n and not pd.isna(rate)) else lg[k]
+            o[f"{k}_delta"] = r((n * own + K * lg[k]) / (n + K), 3)
+            o[f"{k}_n"] = int(n)
+            o[f"{k}_pr"] = r(rate * 100, 1) if n and not pd.isna(rate) else None
+        out[t] = o
+    # Game-to-game noise is large (~7 pts on ~40 neutral plays), so this is a weak hint, not a verdict.
+    # Variable -> default Adaptive in the report; Stable -> Identity; Mixed/Unknown -> Unknown. Analyst 'coach_type' wins.
+    ranked = sorted([t for t in out if out[t]["gp_sd"] is not None], key=lambda t: -out[t]["gp_sd"])
+    for k, t in enumerate(ranked):
+        sd_ = out[t]["gp_sd"]
+        out[t]["gp_rank"] = k + 1 if sd_ > 0 else None
+        out[t]["type"] = "Variable" if sd_ >= 5.0 else ("Stable" if sd_ <= 2.0 else "Mixed")
+    for t in out:
+        if out[t]["n_games"] < 6:
+            out[t]["type"] = "Unknown"
+        out[t].setdefault("type", "Unknown"); out[t].setdefault("gp_rank", None)
+    out["_league"] = {k: r(v, 3) for k, v in lg.items()}
+    return out
+
 # ----------------------------------------------------------------------------- data command
 POS_KEEP = {"QB", "RB", "WR", "TE", "FB"}
 
@@ -287,6 +391,10 @@ def cmd_data(a):
         return blk
     teams = {away: team_block(away), home: team_block(home)}
     lg = {side: {c: r(tb[side][c].mean(), 2) for c in tb[side].columns if not c.endswith("_rank")} for side in tb}
+    cprof = coach_profiles(pbp, S)
+    for t in (away, home):
+        teams[t]["coach"] = cprof.get(t, {"type": "Unknown"})
+    coach_league = cprof.get("_league", {})
 
     def lanes(off_t, def_t):
         out = []
@@ -392,6 +500,17 @@ def cmd_data(a):
                                    "injury": x.report_primary_injury if isinstance(x.report_primary_injury, str) else ""}
 
     # ---------- in-scope selection
+    scope_notes = []
+    forced_add = {norm_name(x) for x in (getattr(a, "add", "") or "").split(",") if x.strip()}
+    team_games_cur = sp[sp.season == S].groupby("team").game_id.nunique().to_dict()
+    ABSENT_CODES = {"EXE", "RES", "SUS", "CUT", "RET", "NON", "PUP"}
+    roster_status = {}
+    if not rosters.empty and "status" in rosters:
+        rw = rosters[(rosters.season == S)]
+        if "week" in rw:
+            rw = rw[rw.week < W] if (rw.week < W).any() else rw
+            rw = rw.sort_values("week")
+        roster_status = rw.drop_duplicates("gsis_id", keep="last").set_index("gsis_id").status.to_dict()
     def select(team, qb_id):
         cur_ros = rosters[(rosters.season == S)] if not rosters.empty else pd.DataFrame()
         if not cur_ros.empty and "week" in cur_ros.columns:
@@ -416,7 +535,7 @@ def cmd_data(a):
             cur = valid[(valid.season == S) & (valid.team == team)]
             def pg(df, c):
                 return df[c].mean() if len(df) else 0
-            wc = len(cur) / (len(cur) + 3.0)
+            wc = len(cur) / (len(cur) + 1.5)   # v2: current-season role counts more (was +3.0)
             if pos in ("WR", "TE"):
                 score = wc * pg(cur, "targets") + (1 - wc) * pg(l10, "targets")
             elif pos == "RB":
@@ -426,7 +545,15 @@ def cmd_data(a):
                 score = wc * pg(cur, "attempts") + (1 - wc) * pg(l10, "attempts")
             snap = cur.snap_pct.mean() if len(cur) else l10.snap_pct.mean()
             st = inj_rows.get(pid, {}).get("status", "None")
-            cands.append({"id": pid, "name": name, "pos": pos, "score": score, "snap": snap, "status": st, "g": g})
+            if roster_status.get(pid) in ABSENT_CODES and st not in ("Questionable",) and pos != "QB":
+                if score >= 3:   # only mention players who would otherwise matter
+                    scope_notes.append(f"{team} {pos} {name} treated as Out: roster status {roster_status.get(pid)} (not on injury report)")
+                st = "Out"
+            # v2: a player with zero games for this team while the team has played is probably not in the role yet
+            if team_games_cur.get(team, 0) >= 1 and len(cur) == 0 and pos != "QB":
+                score *= 0.5
+            cur_ts = (cur.targets.sum() / cur.team_tgt.sum()) if len(cur) and "team_tgt" in cur and cur.team_tgt.sum() else 0.0
+            cands.append({"id": pid, "name": name, "pos": pos, "score": score, "snap": snap, "status": st, "g": g, "cur_ts": cur_ts})
         cands.sort(key=lambda c: -c["score"])
         chosen, vacated = [], []
         def take(pos, n, cond=lambda c: True):
@@ -452,6 +579,19 @@ def cmd_data(a):
         te2 = [c for c in cands if c["pos"] == "TE" and c not in chosen and c not in vacated and c["status"] not in ("Out", "Doubtful")]
         if te2 and (te2[0]["snap"] or 0) >= 40:
             chosen.append(te2[0])
+        # v2 scope: current-role receivers, next man up behind Questionable players, and forced adds
+        healthy = lambda c: c not in chosen and c not in vacated and c["status"] not in ("Out", "Doubtful")
+        for pos, cap in (("WR", 5), ("TE", 3)):
+            for c in [c for c in cands if c["pos"] == pos and healthy(c) and c["cur_ts"] >= .12]:
+                if sum(1 for x in chosen if x["pos"] == pos) < cap:
+                    chosen.append(c); scope_notes.append(f"{team} {pos} {c['name']} added: {c['cur_ts']*100:.0f}% of targets this season")
+            if any(x["pos"] == pos and x["status"] == "Questionable" for x in chosen):
+                nxt = [c for c in cands if c["pos"] == pos and healthy(c)]
+                if nxt and sum(1 for x in chosen if x["pos"] == pos) < cap:
+                    chosen.append(nxt[0]); scope_notes.append(f"{team} {pos} {nxt[0]['name']} added: next man up behind a Questionable {pos}")
+        for c in cands:
+            if norm_name(c["name"]) in forced_add and healthy(c):
+                chosen.append(c); scope_notes.append(f"{team} {c['pos']} {c['name']} added manually (--add)")
         for c in cands:
             if c["status"] in ("Out", "Doubtful") and c not in vacated and c["pos"] != "QB":
                 vacated.append(c)
@@ -579,6 +719,101 @@ def cmd_data(a):
                 h2h_team[t] = {"n": int(len(mt)), "pass_rate_h2h": r(mt.pr.mean() * 100, 1), "pass_rate_season": r(base * 100, 1),
                                "higher_in": int((mt.pr > base).sum())}
 
+    # ---------- v2 game-theory detection -------------------------------------------------
+    # (1) rematch: a lane that dominated a meeting in the last 2 seasons (04 Step 4)
+    rematch = []
+    if not tstats.empty:
+        for t, o in [(away, home), (home, away)]:
+            mt = tstats[(tstats.team == t) & (tstats.opponent_team == o) & (tstats.season >= S - 1)]
+            for _, x in mt.iterrows():
+                seas = tstats[(tstats.team == t) & (tstats.season == x.season)]
+                ra, pa = seas.rushing_yards.mean(), seas.passing_yards.mean()
+                if x.rushing_yards >= max(170, 1.5 * ra):
+                    rematch.append({"team": t, "opp": o, "lane": "Run game", "season": int(x.season), "week": int(x.week),
+                                    "yds": int(x.rushing_yards), "avg": r(ra, 1)})
+                if x.passing_yards >= max(320, 1.4 * pa):
+                    rematch.append({"team": t, "opp": o, "lane": "Pass efficiency", "season": int(x.season), "week": int(x.week),
+                                    "yds": int(x.passing_yards), "avg": r(pa, 1)})
+    # (2) starter-level injuries from snap shares (OL, defensive front, secondary) and absent RB1
+    def starters(team, col):
+        if snaps.empty or col not in snaps:
+            return {}
+        sn = snaps[snaps.team == team]
+        res = {}
+        for seas in (S - 1, S):   # current season overrides; a starter hurt early in his only game still counts via last season
+            g = sn[sn.season == seas].groupby(["player", "position"])[col].mean()
+            for (pn, pp), v in g.items():
+                if v >= 0.6:
+                    res[norm_name(pn)] = pp
+        return res
+    personnel = {}
+    for t in (away, home):
+        so, sdf = starters(t, "offense_pct"), starters(t, "defense_pct")
+        injt = [v for v in inj_rows.values() if v["team"] == t]
+        def pick(st, posset, statuses):
+            return [f"{v['name']} ({v['pos']})" for v in injt if v["status"] in statuses and norm_name(v["name"]) in st
+                    and (v["pos"] in posset or st[norm_name(v["name"])] in posset)]
+        pers = {"ol_out": pick(so, OL_POS, ("Out", "Doubtful")), "ol_q": pick(so, OL_POS, ("Questionable",)),
+                "front_out": pick(sdf, FRONT_POS, ("Out", "Doubtful")), "back_out": pick(sdf, BACK_POS, ("Out", "Doubtful"))}
+        rb1 = [v for v in vac_out if v["team"] == t and v["pos"] == "RB" and (v["carry_share"] or 0) >= .35]
+        pers["rb1_out"] = rb1[0]["name"] if rb1 else None
+        if not rb1 and team_games_cur.get(t, 0) >= 1:
+            prev = sp[(sp.team == t) & (sp.season == S - 1) & (sp.position == "RB")]
+            tot = stats[(stats.team == t) & (stats.season == S - 1)].carries.sum()
+            if len(prev) and tot:
+                shr = prev.groupby("player_id").carries.sum() / tot
+                for pid_, v in shr.items():
+                    if v >= .35 and sp[(sp.player_id == pid_) & (sp.season == S)].empty:
+                        nm_ = prev[prev.player_id == pid_].player_display_name.iloc[0]
+                        pers["rb1_out"] = f"{nm_} (0 games this season, not on injury report)"
+                        warn(f"{t}: {nm_} had {v*100:.0f}% of carries last season and has not played this season; check status (suspension/exempt list/injury)")
+        n_ol = len(pers["ol_out"])
+        pers["one_dimensional"] = n_ol >= 2 or (n_ol >= 1 and bool(pers["rb1_out"]))
+        personnel[t] = pers
+    # (3) lane-label shifts from defensive starter losses and offensive-line losses (applied here so the summary shows them)
+    for t, o in [(away, home), (home, away)]:
+        shifts = {}
+        if len(personnel[o]["front_out"]) >= 2:
+            shifts["Run game"] = (1, f"{o} missing {len(personnel[o]['front_out'])} front-seven starters")
+        if len(personnel[o]["back_out"]) >= 2:
+            for ln in ("Pass efficiency", "WR targets"):
+                shifts[ln] = (1, f"{o} missing {len(personnel[o]['back_out'])} secondary starters")
+        if len(personnel[t]["ol_out"]) >= 2:
+            shifts["Protection vs rush"] = (-1, f"{t} missing {len(personnel[t]['ol_out'])} OL starters")
+        for x in matchups[t]:
+            x["label_raw"] = x["label"]
+            if x["lane"] in shifts:
+                nl = shift_label(x["label"], shifts[x["lane"]][0])
+                if nl != x["label"]:
+                    x["label"] = nl; x["shift_note"] = shifts[x["lane"]][1]
+    # (4) take-away candidates: the data half of the 04 obviousness score (analyst adds DC habit + personnel)
+    takeaway_cands = []
+    for p in out_players:
+        if p["pos"] == "QB":
+            continue
+        pts, why = 0, []
+        m_key = "rush_yds" if p["pos"] == "RB" else "rec_yds"
+        h = (p.get("h2h") or {}).get("metrics", {}).get(m_key)
+        if h and p["h2h"]["n"] <= 2 and (h["h2h_avg"] or 0) >= max(70, 2 * (h["season_avg"] or 0)):
+            pts += 2; why.append(f"dominated last meeting ({h['h2h_avg']:.0f} {m_key} vs {h['season_avg']:.0f} avg)")
+        n_cur = sum(1 for g in p["log"] if g["season"] == S)
+        gl = ((p["metrics"].get(m_key) or {}).get("games") or [])[:n_cur]
+        cts = (p["cur_rates"] or {}).get("target_share") or 0
+        if n_cur >= 2 and ((gl and np.mean(gl) >= 90) or cts >= .25):
+            pts += 1; why.append(f"headline start ({np.mean(gl):.0f} {m_key}/g, {cts*100:.0f}% tgt share this season)")
+        mates = [q for q in out_players if q["team"] == p["team"] and q is not p and q["pos"] in ("WR", "TE")
+                 and q["status"] in ("Questionable", "Doubtful", "Out") and (q["rates"]["target_share"] or 0) >= .15]
+        mates += [v for v in vac_out if v["team"] == p["team"] and (v["target_share"] or 0) >= .15]
+        def cur_share(q):
+            cr = q.get("cur_rates") or {}
+            return (cr.get("target_share") or 0) if cr.get("games", 0) >= 2 else (q["rates"]["target_share"] or 0)
+        top = max([q for q in out_players if q["team"] == p["team"] and q["pos"] != "QB" and q["status"] not in ("Out", "Doubtful")],
+                  key=cur_share, default=None)
+        if mates and top is p:
+            pts += 1; why.append("clearest healthy weapon with key teammate(s) out/limited")
+        if pts >= 2:
+            takeaway_cands.append({"team": p["team"], "name": p["name"], "data_pts": pts, "why": why})
+
     spread = gm.spread_line  # nflverse: positive = home favored by X
     total = gm.total_line
     info = {"season": S, "week": W, "away": away, "home": home, "game_id": gm.game_id, "date": gm.gameday,
@@ -591,6 +826,8 @@ def cmd_data(a):
                              "injury_week": W if inj_rows else None}}
     data = {"info": info, "teams": teams, "league": lg, "matchups": matchups, "players": out_players,
             "vacated": vac_out, "injuries": list(inj_rows.values()), "h2h_team": h2h_team, "warnings": WARN,
+            "rematch": rematch, "personnel": personnel, "takeaway_cands": takeaway_cands, "scope_notes": scope_notes,
+            "coach_league": coach_league,
             "built": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
     with open(os.path.join(a.work, "data.json"), "w") as f:
         json.dump(data, f, default=lambda o: None if (isinstance(o, float) and math.isnan(o)) else str(o))
@@ -638,6 +875,36 @@ def write_summary(d, work):
     L.append("INJURY REPORT: " + "; ".join(f"{x['team']} {x['pos']} {x['name']} {x['status']} ({x['practice'][:20]})" for x in d["injuries"]))
     if d["h2h_team"]:
         L.append("H2H team pass rate: " + "; ".join(f"{t} {v['pass_rate_h2h']}% vs season {v['pass_rate_season']}% (higher in {v['higher_in']}/{v['n']})" for t, v in d["h2h_team"].items()))
+    # ---- v2 game-theory block
+    L.append("GAME THEORY (04):")
+    for t in [i["away"], i["home"]]:
+        c = d["teams"][t].get("coach", {})
+        L.append(f" COACH {t}: {c.get('type', 'Unknown')} game plans (week-to-week variability sd {fmt(c.get('gp_sd'))} pts after noise, over {c.get('n_games', 0)} g, "
+                 f"{c.get('n_cur', 0)} this season) | overall pass {fmt(c.get('overall_pr'))}% | leading 7+ {fmt(c.get('lead_pr'))}% (n {c.get('lead_n', 0)}, "
+                 f"adj delta {fmt((c.get('lead_delta') or 0)*100)}) | trailing 7+ {fmt(c.get('trail_pr'))}% (adj delta {fmt((c.get('trail_delta') or 0)*100)})"
+                 + (" | WARNING most games from last season: confirm same play-caller" if c.get("n_cur", 0) < 4 else ""))
+    for x in d.get("rematch", []):
+        L.append(f" REMATCH FLAG: {x['team']} {x['lane']} dominated {x['opp']} in {x['season']} wk{x['week']} ({x['yds']} yds vs {x['avg']} avg). "
+                 f"Confirm {x['opp']} DC is the same; if so expect over-commitment to this lane (context 'rematch').")
+    for t, pz in d.get("personnel", {}).items():
+        bits = []
+        if pz["ol_out"]: bits.append("OL starters out: " + ", ".join(pz["ol_out"]))
+        if pz["ol_q"]: bits.append("OL starters Q: " + ", ".join(pz["ol_q"]))
+        if pz["rb1_out"]: bits.append("RB1 out: " + pz["rb1_out"])
+        if pz["front_out"]: bits.append("DEF front starters out: " + ", ".join(pz["front_out"]))
+        if pz["back_out"]: bits.append("DEF secondary starters out: " + ", ".join(pz["back_out"]))
+        if bits:
+            L.append(f" PERSONNEL {t}: " + " | ".join(bits))
+        if pz.get("one_dimensional"):
+            L.append(f" ONE-DIMENSIONAL RISK {t}: defense can ignore the run and pin its ears back; auto QB/run efficiency and sack-rate penalties apply (context 'one_dimensional' to adjust)")
+    for t in [i["away"], i["home"]]:
+        for x in d["matchups"][t]:
+            if x.get("shift_note"):
+                L.append(f" LABEL SHIFT {t} {x['lane']}: {x['label_raw']} -> {x['label']} ({x['shift_note']})")
+    for x in d.get("takeaway_cands", []):
+        L.append(f" TAKE-AWAY CANDIDATE {x['team']} {x['name']}: data score {x['data_pts']}/4 ({'; '.join(x['why'])}). Add DC habit/personnel points; 4+ total -> context 'takeaway'")
+    for x in d.get("scope_notes", []):
+        L.append(f" SCOPE: {x}")
     if d["warnings"]:
         L.append("WARNINGS: " + " | ".join(d["warnings"]))
     with open(os.path.join(work, "summary.txt"), "w") as f:
@@ -735,7 +1002,10 @@ def cmd_report(a):
     for p in d["players"]:
         if p["name"] in status:
             p["status"] = status[p["name"]].get("status", p["status"])
-    active = [p for p in d["players"] if p["status"] not in ("Out", "Doubtful")]
+    nodata = [p for p in d["players"] if not any(v for v in (p.get("metrics") or {}).values())]
+    for p in nodata:
+        d.setdefault("warnings", []).append(f"{p['team']} {p['pos']} {p['name']} has no recent games in nflverse: no projections (team volume still modeled)")
+    active = [p for p in d["players"] if p["status"] not in ("Out", "Doubtful") and p not in nodata]
     dropped = [p for p in d["players"] if p["status"] in ("Out", "Doubtful")]
     vac = d["vacated"] + [{"name": p["name"], "team": p["team"], "pos": p["pos"], "status": p["status"],
                            "target_share": p["rates"]["target_share"], "carry_share": p["rates"]["carry_share"],
@@ -749,21 +1019,115 @@ def cmd_report(a):
     def lab(t, lane):
         return labels.get((t, lane), "N/A")
 
-    # ---------- team volume (04 step 5)
-    vol = {}
-    for t in [A, H]:
+    # ---------- v2 game-theory effects (04) --------------------------------------------------
+    gt_notes = []
+    cprof = {t: d["teams"][t].get("coach", {}) for t in (A, H)}
+    ctype = {}
+    for t in (A, H):
+        dt_ = cprof[t].get("type", "Unknown")
+        ctype[t] = ctx.get("coach_type", {}).get(t) or {"Variable": "Adaptive", "Stable": "Identity"}.get(dt_, "Unknown")
+    E0 = {}                          # (team, lane) -> additive efficiency adjustment in every scenario
+    pr_add = {A: 0.0, H: 0.0}        # automatic pass-rate shifts
+    sack_add = {A: 0.0, H: 0.0}
+    h2h_block = set()                # (team, lane) whose H2H boosts are suppressed (rematch rule)
+    onedim = set()                   # teams flagged one-dimensional
+    for k, v in ctx.get("eff", {}).items():
+        t_, ln = k.split(":", 1); E0[(t_, ln)] = E0.get((t_, ln), 0) + v
+        gt_notes.append(f"{t_} {ln} efficiency {v:+.0%} (analyst 'eff')")
+    for x in d.get("rematch", []):
+        t = x["team"]; rc = ctx.get("rematch", {}).get(t, {})
+        if rc is False or rc.get("apply", True) is False:
+            gt_notes.append(f"Rematch flag for {t} {x['lane']} ignored (analyst)"); continue
+        e = rc.get("eff", -0.10)
+        E0[(t, x["lane"])] = E0.get((t, x["lane"]), 0) + e
+        h2h_block.add((t, x["lane"]))
+        msg = f"Rematch rule: {t} {x['lane']} dominated in {x['season']} wk{x['week']} ({x['yds']} yds). {x['opp']} expected to over-commit: {x['lane']} efficiency {e:+.0%}, H2H boosts in that lane removed"
+        if ctype[t] == "Adaptive" or "pass_rate" in rc:
+            prs = rc.get("pass_rate", 0.04 if x["lane"] == "Run game" else -0.04)
+            pr_add[t] += prs; msg += f", pass rate {prs:+.0%} ({ctype[t]} play-caller counters)"
+        gt_notes.append(msg + ".")
+    for t in (A, H):
+        pz = d.get("personnel", {}).get(t, {})
+        oc = ctx.get("one_dimensional", {}).get(t)
+        if oc is False or not (pz.get("one_dimensional") or oc):
+            continue
+        n_ol = min(3, (oc or {}).get("ol_out", len(pz.get("ol_out", []))) if isinstance(oc, dict) else len(pz.get("ol_out", [])))
+        rb = bool(pz.get("rb1_out")) if not isinstance(oc, dict) else oc.get("rb1_out", bool(pz.get("rb1_out")))
+        pe = -0.04 * n_ol - (0.03 if rb else 0)
+        E0[(t, "Pass efficiency")] = E0.get((t, "Pass efficiency"), 0) + pe
+        E0[(t, "Run game")] = E0.get((t, "Run game"), 0) - 0.04 * n_ol
+        sack_add[t] += 0.012 * n_ol
+        prs = 0.02 + (0.02 if rb else 0)
+        pr_add[t] += prs
+        onedim.add(t)
+        gt_notes.append(f"One-dimensional rule: {t} ({n_ol} OL starters out{', RB1 out' if rb else ''}). Defense can ignore the run and rush/blitz: "
+                        f"pass efficiency {pe:+.0%}, run efficiency {-0.04*n_ol:+.0%}, sack rate +{0.012*n_ol*100:.1f} pts, pass rate {prs:+.0%} "
+                        f"(x1.5 when trailing). Expect volume overs with efficiency unders; yardage is a coin flip.")
+    takeaway = {}
+    for t, lst in ctx.get("takeaway", {}).items():
+        items = lst.items() if isinstance(lst, dict) else [(nm, {}) for nm in lst]
+        for nm, cfg in items:
+            takeaway[norm_name(nm)] = {"team": t, "eff": cfg.get("eff", -0.15), "vol": cfg.get("vol", 0.85 if ctype[t] == "Adaptive" else 1.0)}
+            gt_notes.append(f"Take-away target: {nm} ({t}) efficiency {cfg.get('eff', -0.15):+.0%}, volume x{takeaway[norm_name(nm)]['vol']:.2f}; overs blocked unless line <= L10 median.")
+    def eff(t, lane, sc, recv=False):
+        base = (LABEL_ADJ_RECV if recv else LABEL_ADJ)[lab(t, lane)]
+        e = base + E0.get((t, lane), 0) + sc["eff"].get((t, lane), 0)
+        if recv:   # receivers also carry QB/pass-game efficiency shocks (one-dimensional, counter-plan)
+            e += E0.get((t, "Pass efficiency"), 0) + sc["eff"].get((t, "Pass efficiency"), 0)
+        return e
+
+    # ---------- scenarios that drive projections (04 Step 8)
+    def clip(x, lo, hi):
+        return max(lo, min(hi, x))
+    def build_scen():
+        if ctx.get("scenarios_model"):
+            sc = [{"name": z["name"], "prob": z["prob"], "plays": z.get("plays", {}), "pr": z.get("pass_rate", {}),
+                   "eff": {tuple(k.split(":", 1)): v for k, v in z.get("eff", {}).items()}, "desc": z.get("desc", "")} for z in ctx["scenarios_model"]]
+        else:
+            p_fav = 1 - norm_cdf((7 - sp_abs) / 13.5); p_dog = norm_cdf((-7 - sp_abs) / 13.5); rest = 1 - p_fav - p_dog
+            alt = "Shootout" if total >= 46 else "Slugfest"
+            lead = lambda t: clip(0.6 * (cprof[t].get("lead_delta") if cprof[t].get("lead_delta") is not None else -0.10), -0.15, 0.0)
+            trail = lambda t: clip(0.6 * (cprof[t].get("trail_delta") if cprof[t].get("trail_delta") is not None else 0.08) * (1.5 if t in onedim else 1.0), 0.0, 0.15)
+            sc = [{"name": "Base case", "prob": rest * .7, "plays": {}, "pr": {}, "eff": {}, "desc": "one-score game"},
+                  {"name": f"{fav} controls", "prob": p_fav, "plays": {fav: 2, dog: -2}, "pr": {fav: lead(fav), dog: trail(dog)}, "eff": {}, "desc": f"{fav} by 8+"},
+                  {"name": f"{dog} controls", "prob": p_dog, "plays": {dog: 2, fav: -2}, "pr": {dog: lead(dog), fav: trail(fav)}, "eff": {}, "desc": f"{dog} by 8+"},
+                  {"name": alt, "prob": rest * .3, "plays": {A: 2, H: 2} if alt == "Shootout" else {A: -3, H: -3},
+                   "pr": {A: .03, H: .03} if alt == "Shootout" else {A: -.03, H: -.03}, "eff": {},
+                   "desc": f"total {'over ' + str(total + 7) if alt == 'Shootout' else 'under ' + str(total - 7)}"}]
+            cpn = ctx.get("counter_plan")
+            if cpn:
+                pc = clip(cpn.get("prob", .25), .05, .5)
+                take = min(pc, sc[0]["prob"] * .5)   # Base keeps at least half its weight; the rest comes from all other scripts
+                sc[0]["prob"] -= take
+                rem = pc - take
+                if rem > 0:
+                    others = sum(z["prob"] for z in sc[1:])
+                    for z in sc[1:]:
+                        z["prob"] -= rem * z["prob"] / others
+                sc.append({"name": cpn.get("name", "Counter-plan hits"), "prob": pc, "plays": cpn.get("plays", {}), "pr": cpn.get("pass_rate", {}),
+                           "eff": {tuple(k.split(":", 1)): v for k, v in cpn.get("eff", {}).items()}, "desc": cpn.get("desc", "")})
+        tot_ = sum(z["prob"] for z in sc)
+        for z in sc:
+            z["prob"] /= tot_
+        return sc
+    scen = build_scen()
+
+    # ---------- team volume per scenario (04 step 5)
+    def team_vol(t, sc):
         o, dd = d["teams"][t]["off"], d["teams"][opp_of[t]]["def"]
         plays = np.nanmean([o["plays_pg"]["v"] or np.nan, dd["plays_pg"]["v"] or np.nan])
-        plays += ctx.get("plays_adj", {}).get(t, 0)
+        plays += ctx.get("plays_adj", {}).get(t, 0) + sc["plays"].get(t, 0)
         dbr = (o["dropback_rate"]["v"] or 58) / 100
-        dbr += -0.006 * (-team_spread[t]) if True else 0     # favorite passes less, dog more
-        dbr += ctx.get("pass_rate_adj", {}).get(t, 0)
-        sack = np.nanmean([o["sack_rate"]["v"] or np.nan, dd["sack_rate"]["v"] or np.nan]) / 100
+        dbr += -0.006 * (-team_spread[t])     # favorite passes less, dog more
+        dbr += ctx.get("pass_rate_adj", {}).get(t, 0) + pr_add[t] + sc["pr"].get(t, 0)
+        dbr = clip(dbr, .35, .82)
+        sack = np.nanmean([o["sack_rate"]["v"] or np.nan, dd["sack_rate"]["v"] or np.nan]) / 100 + sack_add[t]
         scr = (o["scramble_rate"]["v"] or 3) / 100
         dbs = plays * dbr
-        pass_att = dbs * (1 - sack - scr)
-        rush_att = plays - dbs + dbs * scr
-        vol[t] = {"plays": plays, "db_rate": dbr, "pass_att": pass_att, "rush_att": rush_att, "sack": sack}
+        return {"plays": plays, "db_rate": dbr, "pass_att": dbs * (1 - sack - scr), "rush_att": plays - dbs + dbs * scr, "sack": sack}
+    for z in scen:
+        z["vol"] = {t: team_vol(t, z) for t in (A, H)}
+    vol = {t: {k: sum(z["prob"] * z["vol"][t][k] for z in scen) for k in ("plays", "db_rate", "pass_att", "rush_att", "sack")} for t in (A, H)}
 
     # ---------- share redistribution
     so = ctx.get("share_override", {})
@@ -778,15 +1142,29 @@ def cmd_report(a):
         tp = [p for p in active if p["team"] == t]
         catchers = [p for p in tp if p["pos"] != "QB"]
         rbs = [p for p in tp if p["pos"] == "RB"]
+        # v2: blend current-season role into shares (weight g/(g+1)); L10 alone carries last season's roles forward
+        for p in tp:
+            cr = p.get("cur_rates") or {}
+            g_ = cr.get("games") or 0
+            w_ = g_ / (g_ + 1.0)
+            for k in ("target_share", "carry_share"):
+                if g_ and cr.get(k) is not None and p["rates"].get(k) is not None:
+                    p["rates"][k] = w_ * cr[k] + (1 - w_) * p["rates"][k]
         st = sum(p["rates"]["target_share"] or 0 for p in catchers) or 1
-        sc = sum(p["rates"]["carry_share"] or 0 for p in rbs) or 1
+        sc_ = sum(p["rates"]["carry_share"] or 0 for p in rbs) or 1
         srr = sum(p["rz"].get("rush_share", 0) for p in rbs) or 1
         srt = sum(p["rz"].get("rec_share", 0) for p in catchers) or 1
+        # vacated work goes to whoever holds the role THIS season (current-season share when available)
+        def now(p, k):
+            cr = p.get("cur_rates") or {}
+            return cr[k] if (cr.get("games") or 0) >= 1 and cr.get(k) is not None else (p["rates"][k] or 0)
+        stn = sum(now(p, "target_share") for p in catchers) or 1
+        scn = sum(now(p, "carry_share") for p in rbs) or 1
         for p in tp:
             ts = p["rates"]["target_share"] or 0
             cs = p["rates"]["carry_share"] or 0
-            p["proj_ts"] = ts + (vt * ts / st if p in catchers else 0)
-            p["proj_cs"] = cs + (vc * cs / sc if p in rbs else 0)
+            p["proj_ts"] = ts + (vt * now(p, "target_share") / stn if p in catchers else 0)
+            p["proj_cs"] = cs + (vc * now(p, "carry_share") / scn if p in rbs else 0)
             rr, rt = p["rz"].get("rush_share", 0), p["rz"].get("rec_share", 0)
             p["proj_rzr"] = rr + (vrr * rr / srr if p in rbs else 0)
             p["proj_rzt"] = rt + (vrt * rt / srt if p in catchers else 0)
@@ -794,6 +1172,35 @@ def cmd_report(a):
             p["proj_ts"] = ov.get("target_share", p["proj_ts"]); p["proj_cs"] = ov.get("carry_share", p["proj_cs"])
             p["proj_rzr"] = ov.get("rz_rush_share", p["proj_rzr"]); p["proj_rzt"] = ov.get("rz_rec_share", p["proj_rzt"])
             p["vac_bump"] = bool((vt and p in catchers) or (vc and p in rbs))
+        # shares cannot exceed the team: RBs + QB carries <= 95% of rushes, catchers <= 95% of targets
+        qb_cs = sum(p["rates"]["carry_share"] or 0 for p in tp if p["pos"] == "QB")
+        rb_tot = sum(p["proj_cs"] for p in rbs)
+        if rbs and rb_tot + qb_cs > .95:
+            f_ = max(0.0, .95 - qb_cs) / rb_tot
+            for p in rbs:
+                if p["name"] not in so:
+                    p["proj_cs"] *= f_
+        c_tot = sum(p["proj_ts"] for p in catchers)
+        if catchers and c_tot > .95:
+            for p in catchers:
+                if p["name"] not in so:
+                    p["proj_ts"] *= .95 / c_tot
+        # take-away targets lose volume to teammates (only when the play-caller is expected to counter)
+        for p in tp:
+            tk = takeaway.get(norm_name(p["name"]))
+            if not tk or tk["vol"] >= 1.0:
+                continue
+            others = [q for q in catchers if q is not p and not takeaway.get(norm_name(q["name"]))]
+            lost_t = p["proj_ts"] * (1 - tk["vol"]); lost_r = p["proj_rzt"] * (1 - tk["vol"])
+            p["proj_ts"] -= lost_t; p["proj_rzt"] -= lost_r
+            if p["pos"] == "RB":
+                lost_c = p["proj_cs"] * (1 - tk["vol"]); p["proj_cs"] -= lost_c
+                orb = [q for q in rbs if q is not p]
+                for q in orb:
+                    q["proj_cs"] += lost_c / len(orb)
+            tot_o = sum(q["proj_ts"] for q in others) or 1
+            for q in others:
+                q["proj_ts"] += lost_t * q["proj_ts"] / tot_o; q["proj_rzt"] += lost_r * q["proj_ts"] / tot_o
 
     # ---------- H2H adjustment helper (05)
     dc_changed = ctx.get("dc_changed", {})
@@ -801,8 +1208,11 @@ def cmd_report(a):
         h = p.get("h2h")
         if not h or m not in h["metrics"] or m not in H2H_METRICS:
             return 0.0, None
+        lane_m = "Run game" if m in RUN_METRICS else "Pass efficiency"
         x = h["metrics"][m]
         n = h["n"]
+        if (p["team"], lane_m) in h2h_block and x["delta"] > 0:
+            return 0.0, {"qual": False, **x, "n": n, "weight": 0, "blocked": "rematch rule"}
         side = max(x["above"], x["below"])
         agree = (x["delta"] > 0 and x["above"] >= x["below"]) or (x["delta"] < 0 and x["below"] >= x["above"])
         if n < 3 or side / n < 0.75 or not agree:
@@ -815,15 +1225,16 @@ def cmd_report(a):
         adj = max(-cap, min(cap, adj))
         return adj, {"qual": True, **x, "n": n, "weight": wgt, "adj": adj}
 
-    # ---------- projections
+    # ---------- projections (per scenario, then probability-weighted)
     def expl_lab(t):
         return lab(t, "Explosives/depth")
-    for p in active:
+    def project(p, v, sc):
         t, pos, rt, M = p["team"], p["pos"], p["rates"], p["metrics"]
-        v = vol[t]
+        tk = takeaway.get(norm_name(p["name"]), {})
+        tke = tk.get("eff", 0)
         proj, meta = {}, {}
         if pos == "QB":
-            l1 = LABEL_ADJ[lab(t, "Pass efficiency")]
+            l1 = eff(t, "Pass efficiency", sc)
             att = v["pass_att"]
             proj["pass_att"] = att
             proj["cmp"] = att * (rt["comp_pct"] or .64) * (1 + l1 / 2)
@@ -841,8 +1252,7 @@ def cmd_report(a):
             meta["lane"].update({"rush_att": "Run game", "rush_yds": "Run game", "long_comp": "Explosives/depth"})
         else:
             lane = {"WR": "WR targets", "TE": "TE targets", "RB": "RB receiving"}[pos]
-            la = LABEL_ADJ_RECV[lab(t, lane)]
-            # target share is of TEAM TARGETS, which run ~5-8% below pass attempts (throwaways, spikes)
+            la = eff(t, lane, sc, recv=True) + tke
             tg = v["pass_att"] * min(1.0, rt.get("tgt_per_att") or 0.93) * p["proj_ts"]
             proj["targets"] = tg
             proj["rec"] = tg * (rt["catch_rate"] or .65) * (1 + la / 2)
@@ -851,10 +1261,10 @@ def cmd_report(a):
                 proj["long_rec"] = M["long_rec"]["med"] * (1 + LABEL_ADJ[expl_lab(t)])
             meta["lane"] = {"targets": lane, "rec": lane, "rec_yds": lane, "long_rec": "Explosives/depth"}
             meta["vol"] = {"targets": tg, "rec": tg, "rec_yds": tg, "long_rec": tg}
-            tb = (M.get("targets") or {}).get("wavg")
-            meta["vol_base"] = {"targets": tb, "rec": tb, "rec_yds": tb, "long_rec": tb}
+            tb_ = (M.get("targets") or {}).get("wavg")
+            meta["vol_base"] = {"targets": tb_, "rec": tb_, "rec_yds": tb_, "long_rec": tb_}
             if pos == "RB":
-                lr = LABEL_ADJ[lab(t, "Run game")]
+                lr = eff(t, "Run game", sc) + tke
                 ra = v["rush_att"] * p["proj_cs"]
                 proj["rush_att"] = ra
                 proj["rush_yds"] = ra * (rt["ypc"] or 4.2) * (1 + lr)
@@ -862,8 +1272,14 @@ def cmd_report(a):
                 cb = (M.get("rush_att") or {}).get("wavg")
                 meta["lane"].update({"rush_att": "Run game", "rush_yds": "Run game", "rush_rec_yds": "Run game"})
                 meta["vol"].update({"rush_att": ra, "rush_yds": ra, "rush_rec_yds": ra + tg})
-                meta["vol_base"].update({"rush_att": cb, "rush_yds": cb, "rush_rec_yds": (cb or 0) + (tb or 0)})
-        # H2H
+                meta["vol_base"].update({"rush_att": cb, "rush_yds": cb, "rush_rec_yds": (cb or 0) + (tb_ or 0)})
+        return proj, meta
+    for p in active:
+        per = [(z["prob"], *project(p, z["vol"][p["team"]], z)) for z in scen]
+        proj = {m: sum(w * pr[m] for w, pr, _ in per) for m in per[0][1]}
+        meta = per[0][2]
+        meta["vol"] = {m: sum(w * mt["vol"][m] for w, _, mt in per) for m in meta["vol"]}
+        p["proj_sc"] = [(w, pr) for w, pr, _ in per]
         h2 = {}
         for m in list(proj):
             adj, info = h2h_adj(p, m, proj[m])
@@ -872,6 +1288,8 @@ def cmd_report(a):
             if adj:
                 meta.setdefault("base", {})[m] = proj[m]
                 proj[m] += adj
+                for _, pr in p["proj_sc"]:
+                    pr[m] += adj
         p["proj"], p["meta"], p["h2h_used"] = proj, meta, h2
 
     # ---------- TD model (07)
@@ -1019,22 +1437,32 @@ def cmd_report(a):
         edge = proj - line
         edge_pct = edge / line if line else 0
         yards = m in YARD_MKTS
-        p_over = None
+        imp = american_to_prob(x.odds) if str(x.odds).strip() else None
+        thr_o = max(.57, (imp or 0) + .03)
+        skew = (med / avg) if (med and avg) else 0.9
+        def pov(pv):
+            if yards:
+                # Yardage is right-skewed: center on the projected MEDIAN (proj x L10 median/avg) and use the
+                # player's own spread. A flat % threshold let low-volume players (TE, WR3) clear it on 2-3 yards of noise.
+                center = pv * min(1.0, max(0.6, skew))
+                sd = max(Mm.get("std") or 0, 0.45 * max(pv, 1))
+                return 1 - norm_cdf((line - center) / sd)
+            return prob_over(pv, line, Mm.get("std"))
+        # v2: probability is a mixture over the game-script scenarios, not one point projection
+        sc_po = [(w, pov(pr[m])) for w, pr in p.get("proj_sc", [(1.0, p["proj"])])]
+        p_over = sum(w * q for w, q in sc_po)
         if yards:
-            # Yardage is right-skewed: center on the projected MEDIAN (proj x L10 median/avg) and use the
-            # player's own spread. A flat % threshold let low-volume players (TE, WR3) clear it on 2-3 yards of noise.
-            skew = (med / avg) if (med and avg) else 0.9
-            center = proj * min(1.0, max(0.6, skew))
-            sd = max(Mm.get("std") or 0, 0.45 * max(proj, 1))
-            p_over = 1 - norm_cdf((line - center) / sd)
-            imp = american_to_prob(x.odds) if str(x.odds).strip() else None
-            thr_o = max(.57, (imp or 0) + .03)
             lean = "Over" if p_over >= thr_o and edge_pct >= .08 else ("Under" if (1 - p_over) >= .57 and edge_pct <= -.08 else "Pass")
         else:
-            p_over = prob_over(proj, line, Mm.get("std"))
-            imp = american_to_prob(x.odds) if str(x.odds).strip() else None
-            thr_o = max(.57, (imp or 0) + .03)
             lean = "Over" if p_over >= thr_o else ("Under" if (1 - p_over) >= .57 else "Pass")
+        agree = sum(w for w, q in sc_po if (q >= .5 if lean == "Over" else q <= .5))
+        gate = []
+        key = f"{p['name']}|{m}"
+        if key in ctx.get("kill", {}):
+            lean = "Pass"; gate.append("Gate A: " + ctx["kill"][key])
+        tk = takeaway.get(norm_name(p["name"]))
+        if tk and lean == "Over" and m in (PASS_METRICS | RUN_METRICS | {"rush_rec_yds"}) and not (med is not None and line <= med):
+            lean = "Pass"; gate.append("Gate C: take-away target, line above L10 median")
         sgn = 1 if lean == "Over" else -1
         grp = group_of(p, m)
         in_spot = (p["team"], grp) in spot if grp else False
@@ -1062,18 +1490,8 @@ def cmd_report(a):
                 match = min(5, match + 1)
             elif lean != "Pass":
                 h2h_conf = True
-        # script robustness 0-4
-        isfav = p["team"] == fav
-        if m in ("rec", "targets", "cmp"):
-            rob = 3
-        elif m in ("rec_yds", "rush_rec_yds"):
-            rob = 2
-        elif m in ("long_rec", "long_comp", "pass_td", "int"):
-            rob = 1
-        elif m in ("pass_yds", "pass_att"):
-            rob = (2 if isfav else 3) if lean == "Over" else (3 if isfav else 1)
-        else:  # rush
-            rob = (3 if isfav else 1) if lean == "Over" else (1 if isfav else 3)
+        # script robustness 0-4 (v2): share of scenario probability in which the lean side is favored
+        rob = 4 if agree >= .85 else 3 if agree >= .70 else 2 if agree >= .55 else 1 if agree >= .40 else 0
         rob = robust_over.get(f"{p['name']}|{m}", rob)
         # line value 0-4
         pl_ = p_over if lean != "Under" else 1 - p_over
@@ -1106,6 +1524,16 @@ def cmd_report(a):
             be = base - line
             if (yards and abs(be / line) < .08) or (not yards and abs(be) < .5):
                 cap = min(cap, 16); capnote.append("edge depends on H2H")
+        # v2 gates (04 Step 9)
+        p_side = p_over if lean == "Over" else 1 - p_over
+        if lean != "Pass" and ((yards and abs(edge_pct) > .30) or (not yards and p_side > .72)) and key not in ctx.get("gate_ok", []):
+            if p["flags"] or p["name"] in role_change:
+                cap = min(cap, 12); gate.append("Gate D: edge too big on a player whose role/team changed - treated as model error")
+            else:
+                cap = min(cap, 16); gate.append("Gate D: edge too big - name what the market is missing (gate_ok) or treat as model error")
+        if lean != "Pass" and agree < .50:
+            cap = min(cap, 12); gate.append(f"Gate E: wins in only {agree*100:.0f}% of scripts")
+        capnote += gate
         score = min(score, cap)
         tier = 1 if score >= 21 else 2 if score >= 17 else 3 if score >= 13 else 0
         if lean == "Pass":
@@ -1114,7 +1542,7 @@ def cmd_report(a):
                       "hit": f"{hits_o}/{len(games)}", "hit_u": f"{hits_u}/{len(games)}", "edge": edge, "edge_pct": edge_pct,
                       "lean": lean, "score": score, "p_over": p_over, "tier": tier, "spot": in_spot, "vs": verdict(proj, avg),
                       "parts": dict(usage=round(usage, 1), match=match, rob=rob, lv=lv, cons=cons, pers=pers),
-                      "caps": capnote, "h2h": hu, "h2h_conf": h2h_conf, "label": L, "grp": grp})
+                      "caps": capnote, "h2h": hu, "h2h_conf": h2h_conf, "label": L, "grp": grp, "agree": agree, "gate": gate})
     props.sort(key=lambda z: (-(z["tier"] > 0), z["tier"] if z["tier"] else 9, -z["spot"], -z["score"], -abs(z["edge_pct"])))
     ranked = [z for z in props if z["tier"] > 0][:8]
     fades = [z for z in props if z["lean"] == "Under" and z["tier"] > 0]
@@ -1126,7 +1554,7 @@ def cmd_report(a):
     build_pdf(a, d, ctx, dict(implied=implied, fav=fav, dog=dog, total=total, sp_abs=sp_abs, vol=vol, labels=labels, lab=lab,
                               td_team=td_team, td_rows=td_rows, td_picks=td_picks, td_avoid=td_avoid, props=props, ranked=ranked,
                               fades=fades, groups=groups, spot=spot, active=active, vac=vac, status=status, verdict=verdict,
-                              unmatched=unmatched, lines=lines))
+                              unmatched=unmatched, lines=lines, scen=scen, gt_notes=gt_notes, ctype=ctype, cprof=cprof))
 
 # ----------------------------------------------------------------------------- scenarios / text defaults
 def norm_cdf(x):
@@ -1322,8 +1750,21 @@ def build_pdf(a, d, ctx, R):
     for t in (A, H):
         S.append(P(f"{t} equilibrium plan: {ctx.get('equilibrium', {}).get(t, 'N/A (analyst input not provided)')}"))
     S.append(P(f"Possession strategy: {ctx.get('possession', 'N/A (analyst input not provided)')}"))
-    sc = ctx.get("scenarios") or default_scenarios(d, R)
-    S.append(T([["Scenario", "Prob", "Score range", f"Plays ({A}/{H})", "Tilt", "Benefits", "Hurts"]] + sc, [8, 4, 9, 6, 8, 14, 12], fs=8.5))
+    if R.get("gt_notes"):
+        S.append(P("Game-theory adjustments applied to projections: " + " ".join(R["gt_notes"]), small))
+    S.append(P("Play-caller read: " + " | ".join(
+        f"{t}: {R['ctype'][t]} (data hint: {R['cprof'][t].get('type', 'Unknown')}, week-to-week sd {fmt(R['cprof'][t].get('gp_sd'))} pts; "
+        f"pass rate leading 7+ {fmt(R['cprof'][t].get('lead_pr'))}% vs {fmt(R['cprof'][t].get('overall_pr'))}% overall)" for t in (A, H)), small))
+    if ctx.get("scenarios"):
+        sc = ctx["scenarios"]
+        S.append(T([["Scenario", "Prob", "Score range", f"Plays ({A}/{H})", "Tilt", "Benefits", "Hurts"]] + sc, [8, 4, 9, 6, 8, 14, 12], fs=8.5))
+    else:
+        rows = [["Scenario (drives projections)", "Prob", "Description", f"Plays ({A}/{H})", f"Pass att ({A}/{H})", f"Pass rate shift ({A}/{H})"]]
+        for z in R["scen"]:
+            v = z["vol"]
+            rows.append([z["name"], f"{z['prob']*100:.0f}%", z.get("desc", ""), f"{v[A]['plays']:.0f} / {v[H]['plays']:.0f}",
+                         f"{v[A]['pass_att']:.0f} / {v[H]['pass_att']:.0f}", f"{z['pr'].get(A, 0)*100:+.0f} / {z['pr'].get(H, 0)*100:+.0f} pts"])
+        S.append(T(rows, [10, 4, 14, 6, 6, 7], fs=8.5))
     rows = [["Team", "Proj. Plays", "Proj. Pass Att", "Proj. Rush Att", "Dropback rate", "Sack rate used"]]
     for t in (A, H):
         v = R["vol"][t]
@@ -1343,7 +1784,7 @@ def build_pdf(a, d, ctx, R):
         for x in d["matchups"][t]:
             lb = R["labels"][(t, x["lane"])]
             rows.append([x["lane"], f"{fmt(x['off'], 2)} (#{x['off_rank']})", f"{fmt(x['def'], 2)} (#{x['def_rank']})", f"{x['off_tier']} vs {x['def_tier']}",
-                         lb + (" (override)" if lb != x["label"] else "")])
+                         lb + (" (override)" if lb != x["label"] else "") + (f" (was {x['label_raw']}: {x['shift_note']})" if x.get("shift_note") and lb == x["label"] else "")])
         S.append(T(rows, [8, 8, 9, 10, 6], fs=8.5))
         up = [x["lane"] for x in d["matchups"][t] if R["labels"][(t, x["lane"])] in ("ATTACK", "LEAN ATTACK")]
         dn = [x["lane"] for x in d["matchups"][t] if R["labels"][(t, x["lane"])] in ("FADE", "LEAN FADE")]
@@ -1374,6 +1815,9 @@ def build_pdf(a, d, ctx, R):
         T0 = d["teams"][t]["off"]
         auto = (f"Neutral pass rate {fmt(T0['neutral_pass_rate']['v'])}% (#{T0['neutral_pass_rate']['rank']}), PROE {fmt(T0['proe']['v'])}, pace {fmt(T0.get('pace_sec', {}).get('v'))} s/play, "
                 f"{fmt(T0['plays_pg']['v'])} plays/g. Coach: {i['away_coach'] if t == A else i['home_coach']}.")
+        c = R["cprof"][t]
+        auto += (f" Play-caller read: {R['ctype'][t]} (data hint {c.get('type', 'Unknown')}). Pass rate leading 7+: {fmt(c.get('lead_pr'))}%, "
+                 f"trailing 7+: {fmt(c.get('trail_pr'))}%, overall {fmt(c.get('overall_pr'))}% (last {c.get('n_games', 0)} games, {c.get('n_cur', 0)} this season).")
         S.append(P(f"{t} coaching profile: {auto} {ctx.get('coaching', {}).get(t, '')}", small))
 
     # ---------- 9 grid
@@ -1404,6 +1848,7 @@ def build_pdf(a, d, ctx, R):
     S.append(P("10. Fades and Avoids", h2))
     fl = [f"{z['p']['name']} {MKT_LABEL[z['m']]} Under {z['line']:g}: proj {z['proj']:.1f}, {z['label']} lane, L10 under {z['hit_u']}." for z in R["fades"]]
     fl += [f"{z['p']['name']} {MKT_LABEL[z['m']]} {z['line']:g}: no edge (proj {z['proj']:.1f}, L10 med {fmt(z['med'])})." for z in R["props"] if z["lean"] == "Pass"][:6]
+    fl += [f"{z['p']['name']} {MKT_LABEL[z['m']]} {z['line']:g}: removed by game-theory gate ({'; '.join(z['gate'])})." for z in R["props"] if z.get("gate") and z["lean"] == "Pass"]
     fl += ctx.get("fades", [])
     for x in fl or ["None."]:
         S.append(P("- " + x, small))
@@ -1490,6 +1935,7 @@ def main():
     d = sub.add_parser("data"); d.add_argument("--away", required=True); d.add_argument("--home", required=True)
     d.add_argument("--season", type=int, required=True); d.add_argument("--week", type=int, required=True)
     d.add_argument("--work", default="/home/claude/work")
+    d.add_argument("--add", default="", help="comma-separated player names to force into scope (next man up)")
     l = sub.add_parser("lines"); l.add_argument("--work", default="/home/claude/work"); l.add_argument("--api-key", required=True)
     l.add_argument("--book", default="fanduel")
     rp = sub.add_parser("report"); rp.add_argument("--work", default="/home/claude/work"); rp.add_argument("--lines")
